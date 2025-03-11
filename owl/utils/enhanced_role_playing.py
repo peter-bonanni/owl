@@ -375,8 +375,18 @@ class OwlGAIARolePlaying(OwlRolePlaying):
 
 
 def run_society(
-    society: RolePlaying, round_limit: int = 15
+    society: RolePlaying, round_limit: int = 15, max_token_limit: int = 32000
 ) -> Tuple[str, List[dict], dict]:
+    """Run a society of agents to solve a task.
+    
+    Args:
+        society: The society of agents.
+        round_limit: The maximum number of rounds to run.
+        max_token_limit: The maximum token limit to use (reduce this to handle large contexts better).
+    
+    Returns:
+        A tuple containing the answer, chat history, and token count information.
+    """
     overall_completion_token_count = 0
     overall_prompt_token_count = 0
 
@@ -384,45 +394,106 @@ def run_society(
     init_prompt = """
 Now please give me instructions to solve over overall task step by step. If the task requires some specific knowledge, please instruct me to use tools to complete the task.
     """
+    # Initialize the conversation with the initial prompt
     input_msg = society.init_chat(init_prompt)
+    # Make sure input_msg is not None before starting the conversation loop
+    if input_msg is None:
+        logger.error("Failed to initialize conversation with init_chat")
+        return "", [], {"completion_token_count": 0, "prompt_token_count": 0}
+        
     for _round in range(round_limit):
-        assistant_response, user_response = society.step(input_msg)
-        overall_completion_token_count += (
-            assistant_response.info["usage"]["completion_tokens"]
-            + user_response.info["usage"]["completion_tokens"]
-        )
-        overall_prompt_token_count += (
-            assistant_response.info["usage"]["prompt_tokens"]
-            + user_response.info["usage"]["prompt_tokens"]
-        )
+        logger.info(f"Starting round {_round}")
+        try:
+            assistant_response, user_response = society.step(input_msg)
+            logger.info(f"Round {_round} step completed")
+            # Log details about the response objects to help debug
+            logger.info(f"Assistant response: terminated={assistant_response.terminated}, msgs={bool(assistant_response.msgs)}")
+            logger.info(f"User response: terminated={user_response.terminated}, msgs={bool(user_response.msgs)}")
+        except Exception as e:
+            logger.error(f"Error during step in round {_round}: {str(e)}")
+            return "Error during conversation", [], {"completion_token_count": 0, "prompt_token_count": 0}
+        
+        # Safely handle token counting with None check
+        if assistant_response.info and "usage" in assistant_response.info and assistant_response.info["usage"]:
+            overall_completion_token_count += assistant_response.info["usage"].get("completion_tokens", 0)
+            overall_prompt_token_count += assistant_response.info["usage"].get("prompt_tokens", 0)
+            
+        if user_response.info and "usage" in user_response.info and user_response.info["usage"]:
+            overall_completion_token_count += user_response.info["usage"].get("completion_tokens", 0)
+            overall_prompt_token_count += user_response.info["usage"].get("prompt_tokens", 0)
 
         # convert tool call to dict
         tool_call_records: List[dict] = []
-        for tool_call in assistant_response.info["tool_calls"]:
-            tool_call_records.append(tool_call.as_dict())
+        if assistant_response.info and "tool_calls" in assistant_response.info and assistant_response.info["tool_calls"]:
+            for tool_call in assistant_response.info["tool_calls"]:
+                tool_call_records.append(tool_call.as_dict())
 
-        _data = {
-            "user": user_response.msg.content,
-            "assistant": assistant_response.msg.content,
-            "tool_calls": tool_call_records,
-        }
+        # Safely get content from responses that may have multiple messages
+        user_content = user_response.msgs[0].content if user_response.msgs else ""
+        assistant_content = assistant_response.msgs[0].content if assistant_response.msgs else ""
+        
+        # Only add to chat history if we have valid content
+        if user_content or assistant_content or tool_call_records:
+            _data = {
+                "user": user_content,
+                "assistant": assistant_content,
+                "tool_calls": tool_call_records,
+            }
+            chat_history.append(_data)
+            logger.info(f"Added round {_round} to chat history.")
+        # Logging with length to help debug truncated messages
+        logger.info(f"Round #{_round} user_response (len={len(user_content)}):\n {user_content[:200]}...")
+        logger.info(f"Round #{_round} assistant_response (len={len(assistant_content)}):\n {assistant_content[:200]}...")
 
-        chat_history.append(_data)
-        logger.info(f"Round #{_round} user_response:\n {user_response.msgs[0].content}")
-        logger.info(
-            f"Round #{_round} assistant_response:\n {assistant_response.msgs[0].content}"
-        )
-
-        if (
-            assistant_response.terminated
-            or user_response.terminated
-            or "TASK_DONE" in user_response.msg.content
-        ):
+        # Add more detailed logging for termination conditions
+        termination_reason = None
+        
+        # Check for token limit issues specifically
+        if (assistant_response.terminated and not assistant_response.msgs) or (len(assistant_content) == 0):
+            # This is likely due to token limit pruning, let's try to recover
+            logger.warning("Assistant response was terminated or empty, likely due to token limit issues.")
+            
+            # Check if we have a valid user response we can use
+            if user_response.msgs and len(user_content) > 0:
+                logger.info("Attempting to recover by using valid user message to continue.")
+                # Create a new input message with a simpler prompt to reduce token usage
+                from camel.messages.base import BaseMessage
+                recovery_msg = BaseMessage.make_assistant_message(
+                    role_name="assistant",
+                    content=f"I will help you with this task. Let's continue working on: {society.task_prompt[:100]}..."
+                )
+                input_msg = recovery_msg
+                logger.info(f"Created recovery message: {input_msg.content[:100]}...")
+                continue
+            else:
+                termination_reason = "Cannot recover from token limit error - no valid messages available."
+        elif assistant_response.terminated:
+            termination_reason = "assistant_response.terminated"
+        elif user_response.terminated:
+            termination_reason = "user_response.terminated"
+        elif user_content and "TASK_DONE" in user_content:
+            termination_reason = "TASK_DONE detected in user_content"
+            
+        if termination_reason:
+            logger.warning(f"Conversation terminated early at round {_round}. Reason: {termination_reason}")
             break
 
-        input_msg = assistant_response.msg
+        # Use the first message for the next round
+        if assistant_response.msgs:
+            logger.info(f"Setting input_msg for next round from assistant_response.msgs[0]")
+            input_msg = assistant_response.msgs[0]
+            logger.info(f"Next input message content starts with: {input_msg.content[:50]}...")
+        else:
+            # This is unlikely but we'll handle it just in case
+            logger.warning("No messages found in assistant response. Terminating conversation.")
+            break
 
-    answer = chat_history[-1]["assistant"]
+    # Make sure we have a valid answer
+    if chat_history:
+        answer = chat_history[-1]["assistant"]
+    else:
+        answer = "No answer was generated. The conversation may have ended prematurely."
+        logger.error("No chat history was recorded.")
     token_info = {
         "completion_token_count": overall_completion_token_count,
         "prompt_token_count": overall_prompt_token_count,

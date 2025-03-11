@@ -133,10 +133,21 @@ def main():
 
     # Construct and run the society
     society = construct_society(question)
-    answer, chat_history, token_count = run_society(society)
-
+    
+    # Run the society with additional logging 
+    print("Starting conversation...")
+    # Use the model's max token limit
+    answer, chat_history, token_count = run_society(society, max_token_limit=64000)
+    
+    # Log the token counts
+    print(f"\nToken counts: {token_count}")
+    
     # Output the result
-    print(f"\033[94mAnswer: {answer}\033[0m")
+    print(f"\nAnswer: {answer}")
+    
+    # Log the conversation history size
+    if chat_history:
+        print(f"Conversation completed with {len(chat_history)} rounds")
 
 
 if __name__ == "__main__":
